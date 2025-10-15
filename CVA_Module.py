@@ -1,9 +1,10 @@
 import pandas as pd
 import numpy as np
 from matplotlib import pyplot as plt
-from math import floor, ceil
+from math import floor, ceil, log2
 from time import perf_counter
 from numba import njit
+from scipy.stats import qmc, norm
 
 class CVA():
     def __init__(self, CHART_DIMENTIONS_SINGLE_CHART:tuple=(20,7), CHART_DIMENTIONS_DOUBLE_CHART:tuple=(20,11)):
@@ -54,37 +55,51 @@ class CVA():
 
         return temp_df.loc[new_index]
 
-    def get_short_rate_HW(self, T:float, a:float, sigma:float, rates_df:pd.DataFrame, paths:int=1_000, dt:float=1/12, _print=False) -> np.array :
-        r_0         = rates_df.values[0,0]   # Spot Interest Rates
-        intervals   = floor(T /dt)    
-        f_0_t       = rates_df
-
-        if _print: 
-            print(f'a = {a}, sigma = {sigma}, r_0 = {r_0:.4f}, T = {T}')
+    def get_short_rate_HW(self, T: float, a: float, sigma: float,
+                          rates_df: pd.DataFrame, paths: int = 1_000,
+                          dt: float = 1/12, _print=False) -> np.ndarray:
+        r_0       = rates_df.values[0, 0]      # spot short rate: f(0,0)
+        intervals = floor(T / dt)
+        f_0_t     = rates_df
+    
+        if _print:
+            print(f'a = {a}, sigma = {sigma}, r_0 = {r_0:.6f}, T = {T}')
             print(f'intervals: {intervals} \nTotal Points: {paths*intervals}')
-            print(f'paths: {paths} \ndt:  {dt}')
-        """ -------------------------------------------------------------------------------------------------------------- """
-
-        if _print:_t  = perf_counter()
-        W   = np.random.normal(loc=0.0, scale=np.sqrt(dt), size=(paths,intervals))
+            print(f'paths: {paths} \ndt: {dt}')
+    
+        if _print: _t = perf_counter()
+    
+        # --- Sobol QMC normals (size = paths x intervals) ---
+        sampler = qmc.Sobol(d=intervals, scramble=True)
+        # using random() keeps the signature simple; clip avoids infs in ppf
+        U = sampler.random(n=paths).clip(1e-12, 1-1e-12)
+        W = norm.ppf(U)  # ~ N(0,1)
+    
+        # --- grid + g(t) ---
         t   = f_0_t.index.values[:intervals+1]
-        g_t = f_0_t.values[:intervals+1,0] + (sigma**2/(2*a**2)*(1-np.exp(-a*t)))**2
-
-        hw_r_t        = np.zeros(shape=(paths,intervals+1))
-        hw_r_t[:,0]   = r_0
-        
-        if _print: print(f'hw.shape={hw_r_t.shape}, g_t.shape={g_t.shape}, t.shape={t.shape}')
-
-        @njit()
-        def HW_short_rt(hw_r_t, W):
-            for i in range(intervals):
-                hw_r_t[:,i+1] = hw_r_t[:,i]*np.exp(-a*dt) + g_t[i+1] - g_t[i]*np.exp(-a*dt) + sigma*np.exp(-a*dt) *W[:,i]
-            return hw_r_t
-
-        hw_r_t = HW_short_rt(hw_r_t, W)
-        if _print: 
-            print(f'\n>>Time to simulate: {perf_counter()-_t:.3f}sec')
+        g_t = f_0_t.values[:intervals+1, 0] + (sigma**2 / (2*a*a)) * (1 - np.exp(-a*t))**2
+    
+        hw_r_t      = np.zeros((paths, intervals+1))
+        hw_r_t[:,0] = r_0
+    
+        if _print:
+            print(f'hw.shape={hw_r_t.shape}, g_t.shape={g_t.shape}, t.shape={t.shape}')
+    
+        # exact discretization step
+        exp_adt = np.exp(-a*dt)
+        noise_scale = sigma * np.sqrt((1 - np.exp(-2*a*dt)) / (2*a))  # std of ∫ e^{-a(Δ-τ)} dW_τ
+    
+        for i in range(intervals):
+            hw_r_t[:, i+1] = (
+                hw_r_t[:, i] * exp_adt
+                + g_t[i+1] - g_t[i] * exp_adt
+                + noise_scale * W[:, i]
+            )
+    
+        if _print:
+            print(f'\n>>Time to simulate: {perf_counter()-_t:.3f} sec')
             return hw_r_t, g_t
+    
         return hw_r_t
 
     def discount_factor_for_future_payments(self, forward_df: pd.DataFrame, short_rate_array: np.array, t:float, T :float, payment_frequency:float, 
